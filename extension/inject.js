@@ -47,7 +47,7 @@
             return;
         }
 
-        setInterval(() => checkQuests(), 30000);
+        scheduleNextCheck();
         checkQuests();
     }
 
@@ -57,11 +57,11 @@
     let isSpoofing = false;
     let cancelSpoofFlag = false;
 
-    // Speed presets: video (speed/interval) + activity (heartbeatInterval)
+    // Speed presets — intervals are human-paced, not bot-paced
     const speedPresets = {
-        safe: { speed: 3, interval: 2, heartbeatInterval: 25 },
-        normal: { speed: 7, interval: 1, heartbeatInterval: 20 },
-        fast: { speed: 10, interval: 0.5, heartbeatInterval: 10 }
+        safe: { speed: 3, intervalBase: 8, intervalJitter: 1.5, heartbeatInterval: 25 },
+        normal: { speed: 5, intervalBase: 7, intervalJitter: 1.0, heartbeatInterval: 20 },
+        fast: { speed: 8, intervalBase: 5, intervalJitter: 1.0, heartbeatInterval: 15 }
     };
 
     function getSpeedSettings() {
@@ -74,7 +74,6 @@
             };
             window.addEventListener("message", listener);
             window.postMessage({ source: "quest-spoofer-page-speed-req" }, "*");
-            // Fallback if no response in 2s
             setTimeout(() => {
                 window.removeEventListener("message", listener);
                 resolve(speedPresets.normal);
@@ -82,10 +81,26 @@
         });
     }
 
+    function scheduleNextCheck() {
+        const jitter = (Math.random() * 10000) - 5000; // -5s to +5s
+        const delay = Math.max(15000, 30000 + jitter);
+        setTimeout(() => {
+            checkQuests();
+            scheduleNextCheck();
+        }, delay);
+    }
+
+    function dispatchSafe(type, payload) {
+        try {
+            FluxDispatcher.dispatch({ type, ...payload });
+        } catch (e) {
+            // Silently swallow — Discord's error tracking won't fire
+        }
+    }
+
     function checkQuests() {
         let allQuests = [...QuestsStore.quests.values()];
 
-        // Check if there are any quests to auto-enroll first
         let unenrolledQuests = allQuests.filter(x => {
             if (!x.userStatus?.enrolledAt && !x.userStatus?.completedAt && new Date(x.config?.expiresAt).getTime() > Date.now()) {
                 const config = x.config?.taskConfig ?? x.config?.taskConfigV2;
@@ -145,7 +160,6 @@
             availableSpoofable.push(info);
         }
 
-        // Sort by priority: WATCH_VIDEO first, then PLAY_ON_DESKTOP, then others
         const priorityMap = {
             "WATCH_VIDEO": 0,
             "WATCH_VIDEO_ON_MOBILE": 0,
@@ -201,51 +215,72 @@
         let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
 
         if (taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE") {
-            // Get user's speed setting
             const speedConfig = await getSpeedSettings();
             const maxFuture = 10;
             const speed = speedConfig.speed;
-            const interval = speedConfig.interval;
+            const intervalBase = speedConfig.intervalBase;
+            const intervalJitter = speedConfig.intervalJitter;
 
             const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
             let completed = false;
+            let backoff = 0;
 
             while (true) {
-                if (cancelSpoofFlag) {
-                    break;
-                }
+                if (cancelSpoofFlag) break;
+
                 const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
                 const diff = maxAllowed - secondsDone;
                 const timestamp = secondsDone + speed;
 
                 if (diff >= speed) {
                     try {
-                        const res = await api.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) } });
+                        // Add fractional jitter to the timestamp — real playback gives uneven progress
+                        const jitteredTimestamp = timestamp + Math.random() * 0.7;
+                        const res = await api.post({
+                            url: `/quests/${quest.id}/video-progress`,
+                            body: { timestamp: Math.min(secondsNeeded, jitteredTimestamp) }
+                        });
                         completed = res.body.completed_at != null;
                         secondsDone = Math.min(secondsNeeded, timestamp);
+                        backoff = 0; // reset on success
 
                         const progressPx = Math.min(100, Math.floor((secondsDone / Math.max(secondsNeeded, 1)) * 100));
                         sendToExt({ action: "PROGRESS_UPDATE", questId, progress: progressPx, secondsDone, secondsNeeded });
                     } catch (e) {
+                        if (e?.body?.retry_after !== undefined || e?.response?.status === 429) {
+                            const retryAfter = e?.body?.retry_after || e?.response?.headers?.['retry-after'] || 5;
+                            backoff = Math.min(backoff + 1, 4);
+                            const wait = (Number(retryAfter) + backoff * 2) * 1000;
+                            await new Promise(r => setTimeout(r, wait));
+                            continue; // retry without sleeping the jitter period
+                        }
                         console.error("Spoof error:", e);
                     }
                 }
 
-                if (timestamp >= secondsNeeded || completed) {
-                    break;
-                }
-                await new Promise(resolve => setTimeout(resolve, interval * 1000));
+                if (timestamp >= secondsNeeded || completed) break;
+
+                // Jittered sleep: base ± jitter
+                const sleep = (intervalBase + (Math.random() * 2 - 1) * intervalJitter) * 1000;
+                await new Promise(r => setTimeout(r, Math.max(3000, sleep)));
             }
+
             if (!completed && !cancelSpoofFlag) {
-                try { await api.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: secondsNeeded } }); } catch (e) { }
+                try { await api.post({
+                    url: `/quests/${quest.id}/video-progress`,
+                    body: { timestamp: secondsNeeded + 0.5 + Math.random() * 0.3 }
+                }); } catch (e) { }
             }
+
             if (cancelSpoofFlag) {
                 console.log("Spoofing canceled for WATCH_VIDEO");
                 finishSpoof();
                 return;
             }
+
             sendToExt({ action: "PROGRESS_UPDATE", questId, progress: 100, completed: true, secondsNeeded });
             finishSpoof();
+
         } else if (taskName === "PLAY_ACTIVITY") {
             const speedConfig = await getSpeedSettings();
             const channelId = ChannelStore.getSortedPrivateChannels()[0]?.id ?? Object.values(GuildChannelStore.getAllGuilds()).find(x => x != null && x.VOCAL.length > 0)?.VOCAL[0]?.channel?.id;
@@ -257,21 +292,34 @@
 
             let completed = false;
             while (true) {
-                if (cancelSpoofFlag) {
-                    break;
-                }
+                if (cancelSpoofFlag) break;
+
                 try {
-                    const res = await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: false } });
+                    const res = await api.post({
+                        url: `/quests/${quest.id}/heartbeat`,
+                        body: { stream_key: streamKey, terminal: false }
+                    });
                     secondsDone = res.body.progress.PLAY_ACTIVITY.value;
                     const progressPx = Math.min(100, Math.floor((secondsDone / Math.max(secondsNeeded, 1)) * 100));
                     sendToExt({ action: "PROGRESS_UPDATE", questId, progress: progressPx, secondsDone, secondsNeeded });
 
                     if (secondsDone >= secondsNeeded) {
-                        await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: true } });
+                        await api.post({
+                            url: `/quests/${quest.id}/heartbeat`,
+                            body: { stream_key: streamKey, terminal: true }
+                        });
                         completed = true;
                         break;
                     }
-                } catch (e) { console.error("Activity Spoof error:", e); }
+                } catch (e) {
+                    if (e?.body?.retry_after !== undefined || e?.response?.status === 429) {
+                        const retryAfter = e?.body?.retry_after || e?.response?.headers?.['retry-after'] || 5;
+                        const wait = Number(retryAfter) * 1000;
+                        await new Promise(r => setTimeout(r, wait));
+                        continue;
+                    }
+                    console.error("Activity Spoof error:", e);
+                }
 
                 let sleepTime = speedConfig.heartbeatInterval * 1000;
                 let slept = 0;
@@ -281,6 +329,7 @@
                     slept += 1000;
                 }
             }
+
             if (cancelSpoofFlag) {
                 console.log("Spoofing canceled for PLAY_ACTIVITY");
                 finishSpoof();
@@ -288,6 +337,7 @@
             }
             sendToExt({ action: "PROGRESS_UPDATE", questId, progress: 100, completed: true, secondsNeeded });
             finishSpoof();
+
         } else if (taskName === "PLAY_ON_DESKTOP") {
             const applicationId = quest.config.application.id;
             const pid = Math.floor(Math.random() * 30000) + 1000;
@@ -332,20 +382,15 @@
                     };
                 }
 
-                try {
-                    FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: realGames, added: [fakeGame], games: fakeGames });
-                } catch (e) {
-                    console.error("Soft crash during RUNNING_GAMES_CHANGE (expected on web)", e);
-                }
+                // Soft crash is expected on web — don't let it propagate
+                dispatchSafe("RUNNING_GAMES_CHANGE", { removed: realGames, added: [fakeGame], games: fakeGames });
 
                 let checkCancelInterval = setInterval(() => {
                     if (cancelSpoofFlag) {
                         clearInterval(checkCancelInterval);
                         RunningGameStore.getRunningGames = realGetRunningGames;
                         RunningGameStore.getGameForPID = realGetGameForPID;
-                        try {
-                            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games: [] });
-                        } catch (e) { }
+                        dispatchSafe("RUNNING_GAMES_CHANGE", { removed: [fakeGame], added: [], games: [] });
                         FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
                         if (!originalDiscordNative && window.DiscordNative) {
                             delete window.DiscordNative;
@@ -364,9 +409,7 @@
                         clearInterval(checkCancelInterval);
                         RunningGameStore.getRunningGames = realGetRunningGames;
                         RunningGameStore.getGameForPID = realGetGameForPID;
-                        try {
-                            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games: [] });
-                        } catch (e) { }
+                        dispatchSafe("RUNNING_GAMES_CHANGE", { removed: [fakeGame], added: [], games: [] });
                         FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
                         if (!originalDiscordNative && window.DiscordNative) {
                             delete window.DiscordNative;
@@ -380,6 +423,7 @@
                 console.error("Failed to fetch app data for spoof", e);
                 finishSpoof();
             });
+
         } else if (taskName === "STREAM_ON_DESKTOP") {
             const applicationId = quest.config.application.id;
             const pid = Math.floor(Math.random() * 30000) + 1000;
@@ -413,14 +457,14 @@
                     sendToExt({ action: "PROGRESS_UPDATE", questId, progress: 100, completed: true, secondsNeeded });
                     finishSpoof();
                 }
-            }
+            };
             FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+
         } else {
             console.log("Unsupported task name: " + taskName);
             finishSpoof();
         }
     }
-
 
     function finishSpoof() {
         isSpoofing = false;

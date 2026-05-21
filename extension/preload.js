@@ -1,8 +1,7 @@
-// Quest Spoofer - Network Interception Layer
-// We strictly avoid mocking window.DiscordNative or navigator.userAgent here
-// because Discord's React application will crash if it expects native C++ modules
-// on a pure Web Client. 
-// Instead, we just intercept outbound traffic to spoof the backend payload!
+// Quest Spoofer — Targeted X-Super-Properties interception
+// Only patches quest-related endpoints to avoid detectable fingerprints on all traffic.
+
+const QUEST_PATTERNS = ['/quests/', '/video-progress', '/heartbeat', '/enroll', '/applications/public'];
 
 function patchSuperProperties(value) {
     try {
@@ -13,7 +12,7 @@ function patchSuperProperties(value) {
         props.os = "Windows";
         props.os_arch = "x64";
         props.system_locale = "en-US";
-        // Do NOT touch client_build_number, the active web build is accepted!
+        // Keep client_build_number intact — web build is accepted
         delete props.browser_user_agent;
         delete props.browser_version;
         return btoa(JSON.stringify(props));
@@ -23,7 +22,11 @@ function patchSuperProperties(value) {
     }
 }
 
-// 1. Intercept X-Super-Properties on XHR requests
+function isQuestUrl(url) {
+    return url && QUEST_PATTERNS.some(p => url.includes(p));
+}
+
+// 1. XHR — only intercept quest-related calls
 const originalOpen = XMLHttpRequest.prototype.open;
 const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
@@ -33,15 +36,13 @@ XMLHttpRequest.prototype.open = function (method, url) {
 };
 
 XMLHttpRequest.prototype.setRequestHeader = function (header, value) {
-    if (header.toLowerCase() === 'x-super-properties') {
-        if (!this._url || (!this._url.includes('/claim-reward'))) {
-            value = patchSuperProperties(value);
-        }
+    if (header.toLowerCase() === 'x-super-properties' && isQuestUrl(this._url) && !this._url.includes('/claim-reward')) {
+        value = patchSuperProperties(value);
     }
     return originalSetRequestHeader.apply(this, arguments);
 };
 
-// 2. Intercept fetch API calls (modern Discord endpoints often use fetch)
+// 2. Fetch — only intercept quest-related calls
 const originalFetch = window.fetch;
 window.fetch = async function (resource, config) {
     let url = "";
@@ -53,7 +54,7 @@ window.fetch = async function (resource, config) {
         url = resource.url;
     }
 
-    if (!url.includes('/claim-reward') && config && config.headers) {
+    if (isQuestUrl(url) && !url.includes('/claim-reward') && config && config.headers) {
         if (config.headers instanceof Headers) {
             if (config.headers.has('X-Super-Properties')) {
                 config.headers.set('X-Super-Properties', patchSuperProperties(config.headers.get('X-Super-Properties')));
@@ -71,7 +72,7 @@ window.fetch = async function (resource, config) {
     return originalFetch.apply(this, arguments);
 };
 
-// 3. Intercept WebSocket Identify Payload
+// 3. WebSocket Identify — still needed for quest heartbeats
 const originalSend = window.WebSocket.prototype.send;
 window.WebSocket.prototype.send = function (data) {
     if (typeof data === 'string') {
@@ -95,4 +96,4 @@ window.WebSocket.prototype.send = function (data) {
     return originalSend.apply(this, arguments);
 };
 
-console.log("[Quest Spoofer] Invisible Network Interceptors active.");
+console.log("[Quest Spoofer] Targeted network interceptors active.");
