@@ -6,7 +6,6 @@
     "permissions": [
         "storage",
         "declarativeNetRequest",
-        "declarativeNetRequestWithHostAccess",
         "notifications"
     ],
     "host_permissions": [
@@ -68,18 +67,6 @@
             ],
             "run_at": "document_idle",
             "world": "MAIN"
-        }
-    ],
-    "web_accessible_resources": [
-        {
-            "resources": [
-                "inject.js",
-                "preload.js"
-            ],
-            "matches": [
-                "*://*.discord.com/*",
-                "*://discord.com/*"
-            ]
         }
     ]
 }

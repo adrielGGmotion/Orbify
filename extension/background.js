@@ -61,7 +61,30 @@ function sendToWorker(message) {
     }
 }
 
+const DISCORD_URL_RE = /^https:\/\/([a-z0-9-]+\.)?discord\.com\//;
+
+function isFromPopup(sender) {
+    return sender.id === chrome.runtime.id && !sender.tab &&
+        typeof sender.url === "string" && sender.url.startsWith(chrome.runtime.getURL(""));
+}
+
+function isFromDiscordTab(sender) {
+    return sender.id === chrome.runtime.id && sender.tab &&
+        typeof sender.url === "string" && DISCORD_URL_RE.test(sender.url);
+}
+
+function cleanText(value, max = 100) {
+    return String(value ?? "").replace(/[\u0000-\u001f]/g, "").slice(0, max);
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (!request || typeof request !== "object") return;
+
+    // Popup actions may only come from extension pages, never from a web page.
+    if (typeof request.action === "string" && request.action.startsWith("POPUP_") && !isFromPopup(sender)) return;
+    // Page actions may only come from a Discord tab's content script.
+    if (request.source === "quest-spoofer-page" && !isFromDiscordTab(sender)) return;
+
     // Messages from popup
     if (request.action === "POPUP_GET_QUESTS") {
         chrome.tabs.query({ url: "*://*.discord.com/*" }, (tabs) => {
@@ -95,9 +118,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             workerTabId = sender.tab.id;
         }
 
-        if (request.allValidQuests) {
+        if (Array.isArray(request.allValidQuests)) {
             let newlyFound = false;
-            for (const quest of request.allValidQuests) {
+            for (const quest of request.allValidQuests.slice(0, 100)) {
+                if (!quest || typeof quest.id !== "string") continue;
                 if (!knownQuestIds.has(quest.id)) {
                     knownQuestIds.add(quest.id);
                     newlyFound = true;
@@ -106,7 +130,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             type: 'basic',
                             iconUrl: 'icons/icon.png',
                             title: 'New Discord Quest!',
-                            message: `Orbify found a new quest: ${quest.name}`
+                            message: `Orbify found a new quest: ${cleanText(quest.name)}`
                         });
                     }
                 }
@@ -123,13 +147,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
         }
     } else if (request.action === "PROGRESS_UPDATE") {
-        updateIconProgress(request.progress);
+        updateIconProgress(Math.min(Math.max(Number(request.progress) || 0, 0), 100));
         if (request.completed) {
             // Update stats
             chrome.storage.local.get(['stats'], (res) => {
                 const stats = res.stats || { questsSpoofed: 0, timeSaved: 0 };
                 stats.questsSpoofed += 1;
-                stats.timeSaved += (request.secondsNeeded || 0);
+                stats.timeSaved += Math.min(Math.max(Number(request.secondsNeeded) || 0, 0), 24 * 3600);
                 chrome.storage.local.set({ stats });
                 // Notify popup about stats update
                 chrome.runtime.sendMessage({ action: "STATS_UPDATED", stats }).catch(() => { });
@@ -155,7 +179,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
     } else if (request.action === "CONNECTION_ERROR") {
         // Forward to popup
-        chrome.runtime.sendMessage({ action: "CONNECTION_ERROR", message: request.message }).catch(() => { });
+        chrome.runtime.sendMessage({ action: "CONNECTION_ERROR", message: cleanText(request.message, 200) }).catch(() => { });
     }
 });
 

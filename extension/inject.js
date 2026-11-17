@@ -2,6 +2,26 @@
     let wpRequire;
     let ApplicationStreamingStore, RunningGameStore, QuestsStore, ChannelStore, GuildChannelStore, FluxDispatcher, api;
 
+    const ORIGIN = window.location.origin;
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Enrollment bookkeeping so we never fire duplicate or repeated enroll requests.
+    const enrollInFlight = new Set();
+    const enrollFailures = new Map(); // questId -> { count, retryAt }
+    let enrollQueueRunning = false;
+
+    // Consecutive-error handling for progress loops: back off and give up instead of hammering the API.
+    const MAX_CONSECUTIVE_ERRORS = 5;
+    function errorDelayMs(e, attempt) {
+        const retryAfter = Number(e?.body?.retry_after ?? e?.retry_after);
+        if (e?.status === 429 && retryAfter > 0) return Math.ceil(retryAfter * 1000) + 500;
+        return Math.min(60000, 2000 * 2 ** attempt);
+    }
+    function isFatal(e) {
+        // Auth / forbidden / not found: retrying won't help.
+        return e?.status === 401 || e?.status === 403 || e?.status === 404;
+    }
+
     let initRetries = 0;
     const MAX_INIT_RETRIES = 5;
 
@@ -67,13 +87,13 @@
     function getSpeedSettings() {
         return new Promise((resolve) => {
             let listener = (event) => {
-                if (event.source !== window || !event.data || event.data.source !== "quest-spoofer-ext-speed") return;
+                if (event.source !== window || event.origin !== ORIGIN || !event.data || event.data.source !== "quest-spoofer-ext-speed") return;
                 window.removeEventListener("message", listener);
                 const preset = speedPresets[event.data.spoofSpeed] || speedPresets.normal;
                 resolve(preset);
             };
             window.addEventListener("message", listener);
-            window.postMessage({ source: "quest-spoofer-page-speed-req" }, "*");
+            window.postMessage({ source: "quest-spoofer-page-speed-req" }, ORIGIN);
             // Fallback if no response in 2s
             setTimeout(() => {
                 window.removeEventListener("message", listener);
@@ -94,25 +114,21 @@
             return false;
         });
 
-        if (unenrolledQuests.length > 0) {
-            let listener = (event) => {
-                if (event.source !== window || !event.data || event.data.source !== "quest-spoofer-ext-settings") return;
-                window.removeEventListener("message", listener);
+        const toEnroll = unenrolledQuests.filter(x => {
+            if (enrollInFlight.has(x.id)) return false;
+            const f = enrollFailures.get(x.id);
+            return !f || (f.count < 3 && Date.now() >= f.retryAt);
+        });
 
-                if (event.data.autoAccept) {
-                    unenrolledQuests.forEach(x => {
-                        api.post({
-                            url: `/quests/${x.id}/enroll`,
-                            body: { location: 11 }
-                        }).then(() => {
-                            console.log("Auto-enrolled in quest:", x.config.messages.questName);
-                            setTimeout(checkQuests, 1500);
-                        }).catch(e => console.error("Failed to auto-enroll quest", x.id, e));
-                    });
-                }
+        if (toEnroll.length > 0 && !enrollQueueRunning) {
+            let listener = (event) => {
+                if (event.source !== window || event.origin !== ORIGIN || !event.data || event.data.source !== "quest-spoofer-ext-settings") return;
+                window.removeEventListener("message", listener);
+                if (event.data.autoAccept) enrollSequentially(toEnroll);
             };
             window.addEventListener("message", listener);
-            window.postMessage({ source: "quest-spoofer-page-settings-req" }, "*");
+            setTimeout(() => window.removeEventListener("message", listener), 2000);
+            window.postMessage({ source: "quest-spoofer-page-settings-req" }, ORIGIN);
         }
 
         let quests = allQuests.filter(x => {
@@ -162,12 +178,44 @@
         sendToExt({ action: "QUESTS_UPDATE", available: availableSpoofable, currentSpoofQuest, allValidQuests });
     }
 
+    // Enroll one quest at a time, with a pause between requests, instead of a parallel burst.
+    async function enrollSequentially(list) {
+        if (enrollQueueRunning) return;
+        enrollQueueRunning = true;
+        let enrolledAny = false;
+        try {
+            for (const x of list) {
+                enrollInFlight.add(x.id);
+                try {
+                    await api.post({ url: `/quests/${x.id}/enroll`, body: { location: 11 } });
+                    enrollFailures.delete(x.id);
+                    enrolledAny = true;
+                    console.log("Auto-enrolled in quest:", x.config.messages.questName);
+                } catch (e) {
+                    const prev = enrollFailures.get(x.id)?.count ?? 0;
+                    enrollFailures.set(x.id, {
+                        count: isFatal(e) ? 3 : prev + 1,
+                        retryAt: Date.now() + errorDelayMs(e, prev + 2)
+                    });
+                    console.error("Failed to auto-enroll quest", x.id, e);
+                    if (e?.status === 429) { await sleep(errorDelayMs(e, 0)); }
+                } finally {
+                    enrollInFlight.delete(x.id);
+                }
+                await sleep(3000);
+            }
+        } finally {
+            enrollQueueRunning = false;
+        }
+        if (enrolledAny) setTimeout(checkQuests, 1500);
+    }
+
     function sendToExt(msg) {
-        window.postMessage({ source: "quest-spoofer-page", ...msg }, "*");
+        window.postMessage({ source: "quest-spoofer-page", ...msg }, ORIGIN);
     }
 
     window.addEventListener("message", (event) => {
-        if (event.source !== window || !event.data || event.data.source !== "quest-spoofer-ext") return;
+        if (event.source !== window || event.origin !== ORIGIN || !event.data || event.data.source !== "quest-spoofer-ext") return;
 
         if (event.data.action === "START_SPOOF" && event.data.questId) {
             startSpoofing(event.data.questId);
@@ -209,6 +257,9 @@
 
             const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
             let completed = false;
+            let errors = 0;
+            let aborted = false;
+            let lastError = null;
 
             while (true) {
                 if (cancelSpoofFlag) {
@@ -226,8 +277,13 @@
 
                         const progressPx = Math.min(100, Math.floor((secondsDone / Math.max(secondsNeeded, 1)) * 100));
                         sendToExt({ action: "PROGRESS_UPDATE", questId, progress: progressPx, secondsDone, secondsNeeded });
+                        errors = 0;
                     } catch (e) {
                         console.error("Spoof error:", e);
+                        errors++;
+                        if (isFatal(e) || errors >= MAX_CONSECUTIVE_ERRORS) { aborted = true; break; }
+                        await sleep(errorDelayMs(e, errors));
+                        continue;
                     }
                 }
 
@@ -236,8 +292,13 @@
                 }
                 await new Promise(resolve => setTimeout(resolve, interval * 1000));
             }
-            if (!completed && !cancelSpoofFlag) {
+            if (!completed && !cancelSpoofFlag && !aborted) {
                 try { await api.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: secondsNeeded } }); } catch (e) { }
+            }
+            if (aborted) {
+                sendToExt({ action: "CONNECTION_ERROR", message: "Stopped after repeated errors from Discord. Try again later." });
+                finishSpoof();
+                return;
             }
             if (cancelSpoofFlag) {
                 console.log("Spoofing canceled for WATCH_VIDEO");
@@ -256,6 +317,9 @@
             const streamKey = `call:${channelId}:1`;
 
             let completed = false;
+            let errors = 0;
+            let aborted = false;
+            let lastError = null;
             while (true) {
                 if (cancelSpoofFlag) {
                     break;
@@ -271,15 +335,28 @@
                         completed = true;
                         break;
                     }
-                } catch (e) { console.error("Activity Spoof error:", e); }
+                    errors = 0;
+                } catch (e) {
+                    console.error("Activity Spoof error:", e);
+                    lastError = e;
+                    errors++;
+                    if (isFatal(e) || errors >= MAX_CONSECUTIVE_ERRORS) { aborted = true; break; }
+                }
 
-                let sleepTime = speedConfig.heartbeatInterval * 1000;
+                let sleepTime = errors > 0
+                    ? Math.max(speedConfig.heartbeatInterval * 1000, errorDelayMs(lastError, errors))
+                    : speedConfig.heartbeatInterval * 1000;
                 let slept = 0;
                 while (slept < sleepTime) {
                     if (cancelSpoofFlag) break;
                     await new Promise(resolve => setTimeout(resolve, 1000));
                     slept += 1000;
                 }
+            }
+            if (aborted) {
+                sendToExt({ action: "CONNECTION_ERROR", message: "Stopped after repeated errors from Discord. Try again later." });
+                finishSpoof();
+                return;
             }
             if (cancelSpoofFlag) {
                 console.log("Spoofing canceled for PLAY_ACTIVITY");
