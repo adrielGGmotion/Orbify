@@ -104,7 +104,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Listen for updates from background/content script
     chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+        if (sender.id !== chrome.runtime.id || !request || typeof request !== "object") return;
         if (request.action === "QUESTS_UPDATE") {
+            if (!Array.isArray(request.available)) return;
             connectionError.classList.add('hidden');
             renderQuests(request.available, request.currentSpoofQuest);
         } else if (request.action === "PROGRESS_UPDATE") {
@@ -154,13 +156,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 const isSpoofingThis = currentSpoofQuest === q.id;
                 const isSpoofingOther = currentSpoofQuest && currentSpoofQuest !== q.id;
 
-                let btnHTML = "";
+                // Buttons built with DOM APIs (quest ids come from the page, never put them in HTML)
+                let btn = null;
                 if (q.progress >= 100 || q.completed) {
                     // No button, user can claim via Discord UI
                 } else if (isSpoofingThis) {
-                    btnHTML = `<button id="cancel-${q.id}" class="cancel-btn">Cancel</button>`;
+                    btn = document.createElement('button');
+                    btn.className = 'cancel-btn';
+                    btn.textContent = 'Cancel';
                 } else {
-                    btnHTML = `<button id="btn-${q.id}" ${isSpoofingOther ? 'disabled' : ''}>Start Spoofing</button>`;
+                    btn = document.createElement('button');
+                    btn.textContent = 'Start Spoofing';
+                    btn.disabled = !!isSpoofingOther;
                 }
 
                 // Build quest card using safe DOM APIs
@@ -207,19 +214,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 el.appendChild(statsDiv);
                 el.appendChild(progressContainer);
 
-                // Buttons (hardcoded text, safe to use innerHTML on isolated element)
-                if (btnHTML) {
-                    const btnContainer = document.createElement('div');
-                    btnContainer.innerHTML = btnHTML;
-                    while (btnContainer.firstChild) {
-                        el.appendChild(btnContainer.firstChild);
-                    }
-                }
+                if (btn) el.appendChild(btn);
 
                 questList.appendChild(el);
 
                 if (!isSpoofingThis && q.progress < 100 && !q.completed) {
-                    const btn = document.getElementById(`btn-${q.id}`);
                     if (btn) {
                         btn.addEventListener('click', () => {
                             btn.disabled = true;
@@ -231,7 +230,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         });
                     }
                 } else if (isSpoofingThis) {
-                    const cancelBtn = document.getElementById(`cancel-${q.id}`);
+                    const cancelBtn = btn;
                     if (cancelBtn) {
                         cancelBtn.addEventListener('click', () => {
                             cancelBtn.disabled = true;
@@ -247,6 +246,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function updateProgress(questId, progress, secondsDone, secondsNeeded) {
+        progress = Math.min(Math.max(Number(progress) || 0, 0), 100);
         const bar = document.getElementById(`bar-${questId}`);
         const txt = document.getElementById(`txt-${questId}`);
         const eta = document.getElementById(`eta-${questId}`);
@@ -267,7 +267,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (progress >= 100) {
-            const btn = document.querySelector(`#quest-${questId} button`);
+            const card = document.getElementById(`quest-${questId}`);
+            const btn = card && card.querySelector('button');
             if (btn) {
                 btn.remove();
             }
